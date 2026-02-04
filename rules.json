@@ -1,0 +1,61 @@
+{
+  "version": "1.0.0",
+  "actes": {
+    "AMO_20": {
+      "code": "AMO_20",
+      "libelle": "Bilan prévention parental",
+      "type": "bilan",
+      "contraintes": {
+        "age_max_mois": 36,
+        "renouvellement_decote_pct": 30,
+        "renouvellement_delai_jours": 365
+      },
+      "exclusions_meme_jour": ["AMO_12.1", "AMO_12.6"]
+    },
+    "AMO_34": {
+      "code": "AMO_34",
+      "libelle": "Bilan langage oral/écrit",
+      "type": "bilan",
+      "contraintes": {
+        "renouvellement_decote_pct": 30,
+        "renouvellement_delai_jours": 365
+      },
+      "exclusions_meme_jour": ["AMO_12.1", "AMO_11.6", "AMO_13.5"]
+    },
+    "AMO_13.5": {
+        "code": "AMO_13.5",
+        "type": "reeducation",
+        "exclusions_meme_jour": ["AMO_34"]
+    }
+  },
+  "regles_transversales": [
+    {
+      "id": "R1",
+      "nom": "Limite Age AMO 20",
+      "condition": {
+        "code_concerne": "AMO_20",
+        "test": "age_patient_mois > 36"
+      },
+      "message": "REJET: AMO 20 interdit si patient > 3 ans.",
+      "severite": "BLOCKING"
+    },
+    {
+      "id": "RT1",
+      "nom": "Renouvellement < 12 mois",
+      "condition": {
+        "test": "last_bilan_date IS NOT NULL AND (current_date - last_bilan_date).days < 365"
+      },
+      "message": "ALERTE: Bilan déjà facturé il y a moins d'un an. Décote -30% requise.",
+      "severite": "WARNING"
+    },
+    {
+      "id": "R16",
+      "nom": "Cumul Interdit Bilan/Séance",
+      "condition": {
+        "test": "bilan_in_input AND seance_in_input AND date_bilan == date_seance"
+      },
+      "message": "REJET: Interdiction absolue de facturer Bilan et Séance le même jour.",
+      "severite": "BLOCKING"
+    }
+  ]
+}
