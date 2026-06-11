@@ -154,7 +154,7 @@ with tab_audit:
                 f"Score de risque : {report.risk_score}</span>",
                 unsafe_allow_html=True,
             )
-            for r in sorted(report.risks, key=lambda x: x.act_date):
+            for r in sorted(report.risks, key=lambda x: (x.severity == "WARNING", x.act_date)):
                 with st.expander(
                     f"{'⛔' if r.severity == 'BLOCKING' else '⚠️'} "
                     f"{r.act_date} · {', '.join(r.codes)} · {r.rule_id}"

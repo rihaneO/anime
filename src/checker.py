@@ -103,7 +103,7 @@ class Checker:
         """
         valeur = self._ref.lettre_cle().valeur_metropole
         total = sum(
-            (self._ref.get_acte(c).coefficient if self._ref.get_acte(c) else 0)
+            (acte.coefficient if (acte := self._ref.get_acte(c)) else 0)
             for c in codes
         )
         if decote_pct:
@@ -121,8 +121,13 @@ class Checker:
         current_date = parsed_data.get("date") or _today()
         input_codes = parsed_data.get("codes") or []
 
-        bilan_codes = [c for c in input_codes if self._get_act_type(c) == "bilan"]
-        seance_codes = [c for c in input_codes if self._get_act_type(c) == "reeducation"]
+        bilan_codes, seance_codes = [], []
+        for c in input_codes:
+            t = self._get_act_type(c)
+            if t == "bilan":
+                bilan_codes.append(c)
+            elif t == "reeducation":
+                seance_codes.append(c)
 
         last_bilan_date = None
         if self.db and patient_id and bilan_codes:

@@ -4,7 +4,7 @@ NLPParser — extraction d'actes NGAP, dates et ages en texte libre.
 Architecture multi-pass :
   0. Isolation des "spans parasites" (dates, annees, ages explicites)
      -> masquage pour eviter les faux positifs lors de la detection de codes.
-  A. Codes AMO explicites : regex AMO\s*[\d.,]+ -> normalise via Referential.
+  A. Codes AMO explicites : regex AMO\\s*[\\d.,]+ -> normalise via Referential.
   B. Detection par libelle : score IDF-like sur les tokens du texte vs
      l'index inverse du Referential.
   Deduplication + tri par confiance decroissante.
@@ -95,13 +95,11 @@ _RE_YEAR_4 = re.compile(r"\b(?:19|20)\d{2}\b")
 
 
 def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
-    """Remplace les caracteres des spans par des espaces (preserves les positions)."""
-    buf = bytearray(text.encode("utf-8"))  # on travaille byte par byte sur l'ASCII
-    # On rebascule sur une liste de chars pour la simplicite (texte pas enorme)
+    """Remplace les caracteres des spans par le marqueur NULL (preserve les positions)."""
     chars = list(text)
     for s, e in spans:
         for i in range(s, min(e, len(chars))):
-            chars[i] = "\x00"  # marqueur NULL ; ne matche pas les regexes metier
+            chars[i] = "\x00"
     return "".join(chars)
 
 
@@ -375,12 +373,14 @@ def _deduplicate(matches: list[ExtractionMatch]) -> list[ExtractionMatch]:
 # API module-level (compat ascendante avec les anciens tests et app.py)
 # ------------------------------------------------------------------ #
 
+import os
+import functools
+
+
+@functools.lru_cache(maxsize=1)
 def _default_ref() -> Referential:
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return Referential(os.path.join(base, "rules.json"))
-
-
-import os  # noqa: E402  (import retarde pour eviter la circularite potentielle)
 
 
 def extract_act_codes(text: str, ref: Optional[Referential] = None) -> list[str]:
