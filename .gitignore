@@ -11,6 +11,8 @@ env/
 
 # Bases de donnees locales (donnees patients — ne JAMAIS versionner)
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
