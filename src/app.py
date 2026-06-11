@@ -1,25 +1,27 @@
 import streamlit as st
 from datetime import datetime
-from nlp_parser import extract_act_codes, extract_date, extract_patient_age_months
+from referential import Referential
+from nlp_parser import NLPParser
 from checker import Checker
 from db import Database
-from audit import build_patient_report, format_report_text
+from audit import build_patient_report, build_csv_report, format_report_text
 import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_PATH = os.path.join(BASE_DIR, "rules.json")
 DB_PATH = os.path.join(BASE_DIR, "neuro_shield.db")
 
+ref = Referential(RULES_PATH)
 db = Database(db_path=DB_PATH)
-checker = Checker(rules_path=RULES_PATH, db=db)
+checker = Checker(ref=ref, db=db)
 
 st.set_page_config(page_title="Neuro-Shield", page_icon="🛡️", layout="wide")
 st.title("🛡️ Neuro-Shield — Conformité NGAP")
 
-_amo = checker.rules.get("lettre_cle", {}).get("valeur_eur", {}).get("metropole")
+lc = ref.lettre_cle()
 st.caption(
-    f"Référentiel v{checker.rules.get('schema_version', '?')} · "
-    f"AMO métropole {_amo} € · Avenant 21 (23/02/2026)"
+    f"Référentiel v{ref.schema_version()} · "
+    f"AMO métropole {lc.valeur_metropole} € · Avenant 21 (23/02/2026)"
 )
 
 # ------------------------------------------------------------------ #
@@ -40,7 +42,11 @@ if patient_name:
 # ------------------------------------------------------------------ #
 # Onglets
 # ------------------------------------------------------------------ #
-tab_check, tab_audit = st.tabs(["🔍 Vérifier une facturation", "📋 Audit anti-indu"])
+tab_check, tab_audit, tab_csv = st.tabs([
+    "🔍 Vérifier une facturation",
+    "📋 Audit anti-indu",
+    "📂 Import CSV",
+])
 
 # ========== ONGLET 1 : vérification à la volée ==================== #
 with tab_check:
@@ -61,27 +67,28 @@ with tab_check:
 
     if analyze_btn and raw_text:
         with st.spinner("Analyse..."):
-            # 1. Extraction
-            raw_codes = extract_act_codes(raw_text)
-            codes = checker.normalize_codes(raw_codes)   # <-- normalisation alias
-            date_obj = extract_date(raw_text) or datetime.now().date()
-            age_months = extract_patient_age_months(raw_text, ref_date=date_obj)
+            parsed = NLPParser(ref).parse(raw_text)
+            codes = checker.normalize_codes(parsed.codes)
+            date_obj = parsed.act_date or datetime.now().date()
+            age_months = parsed.age_months
 
-            if not extract_date(raw_text):
+            if parsed.act_date is None:
                 st.warning("Date non trouvée — date du jour utilisée.")
 
-            # Résumé extraction
+            for w in parsed.warnings:
+                if "age" in w.lower() or "date" in w.lower():
+                    continue  # deja affiche ci-dessus
+                st.info(w)
+
             st.info(
                 f"**Extraits** · Actes : {', '.join(codes) or 'Aucun'} · "
                 f"Date : {date_obj} · "
                 f"Âge : {f'{age_months} mois' if age_months is not None else 'non détecté'}"
             )
 
-            # 2. Contrôle
             parsed_data = {"codes": codes, "date": date_obj, "age_months": age_months}
             results = checker.check(parsed_data, patient_id=patient_name)
 
-            # Montant (décote auto si RT1)
             decote = 30 if any(r["id"] == "RT1" for r in results) else 0
             montant = checker.compute_amount(codes, decote_pct=decote)
             if codes:
@@ -90,7 +97,6 @@ with tab_check:
                     label += " *(décote renouvellement −30 % appliquée)*"
                 st.info(label)
 
-            # 3. Affichage
             with result_box:
                 if not results:
                     st.success("✅ CONFORME — aucune anomalie.")
@@ -133,9 +139,11 @@ with tab_audit:
         with st.spinner("Analyse de l'historique..."):
             report = build_patient_report(audit_patient, db, checker)
 
-        st.markdown(f"**{report.total_acts} actes analysés** · "
-                    f"**{len(report.risks)} risques** détectés "
-                    f"({report.blocking_count} REJET / {report.warning_count} ALERTE)")
+        st.markdown(
+            f"**{report.total_acts} actes analysés** · "
+            f"**{len(report.risks)} risques** détectés "
+            f"({report.blocking_count} REJET / {report.warning_count} ALERTE)"
+        )
 
         if report.risk_score == 0:
             st.success("✅ Aucun risque détecté dans l'historique.")
@@ -146,14 +154,13 @@ with tab_audit:
                 f"Score de risque : {report.risk_score}</span>",
                 unsafe_allow_html=True,
             )
-            for r in sorted(report.risks, key=lambda x: x.date):
+            for r in sorted(report.risks, key=lambda x: x.act_date):
                 with st.expander(
                     f"{'⛔' if r.severity == 'BLOCKING' else '⚠️'} "
-                    f"{r.date} · {', '.join(r.codes)} · {r.rule_id}"
+                    f"{r.act_date} · {', '.join(r.codes)} · {r.rule_id}"
                 ):
                     st.write(r.message)
 
-        # Export texte
         st.text_area(
             "Rapport exportable",
             value=format_report_text(report),
@@ -163,3 +170,95 @@ with tab_audit:
 
     elif audit_btn:
         st.error("Entrez un nom de patient.")
+
+# ========== ONGLET 3 : import CSV ================================ #
+with tab_csv:
+    st.subheader("Import CSV — audit multi-lignes")
+    st.markdown(
+        "Importez un export CSV (VEGA, Orthomax, saisie manuelle). "
+        "Colonnes requises : **code acte** + **date**. Colonne patient optionnelle."
+    )
+
+    uploaded = st.file_uploader(
+        "Fichier CSV",
+        type=["csv", "txt"],
+        help="Encodages supportés : UTF-8, UTF-8-BOM, Latin-1, CP1252. "
+             "Séparateurs auto-détectés : ; , \\t |",
+    )
+    patient_filter_csv = st.text_input(
+        "Filtrer par patient (laisser vide pour auditer tous)", value=""
+    )
+    csv_btn = st.button("Importer et auditer 📂", type="secondary", key="csv_btn")
+
+    if csv_btn and uploaded:
+        raw_bytes = uploaded.read()
+        patient_filter = patient_filter_csv.strip() or None
+
+        with st.spinner("Import et analyse CSV..."):
+            report, result = build_csv_report(raw_bytes, patient_filter, db, checker)
+
+        # Résumé import
+        st.info(result.summary())
+
+        col_imp, col_sch = st.columns(2)
+        with col_imp:
+            st.metric("Lignes importées", result.ok_count)
+            st.metric("Erreurs d'import", result.error_count)
+        with col_sch:
+            if result.schema:
+                st.metric("Colonne code", result.schema.code_col or "—")
+                st.metric("Colonne date", result.schema.date_col or "—")
+
+        if result.errors:
+            with st.expander(f"⚠️ {result.error_count} erreur(s) d'import (non-fatales)"):
+                for e in result.errors:
+                    st.caption(
+                        f"Ligne {e.line_number} · [{e.field}={repr(e.value)}] : {e.reason}"
+                    )
+
+        if result.unresolved_codes:
+            st.warning(
+                f"Codes non reconnus dans le référentiel : "
+                f"{', '.join(result.unresolved_codes)}. "
+                "Ces actes sont inclus mais les règles ne s'y appliquent pas."
+            )
+
+        st.divider()
+
+        # Rapport d'audit
+        patient_label = patient_filter or "TOUS"
+        st.markdown(
+            f"**Rapport pour : {patient_label}** · "
+            f"{report.total_acts} actes · "
+            f"{len(report.risks)} risques "
+            f"({report.blocking_count} REJET / {report.warning_count} ALERTE)"
+        )
+
+        if report.risk_score == 0:
+            st.success("✅ Aucun risque détecté.")
+        else:
+            score_color = "red" if report.blocking_count > 0 else "orange"
+            st.markdown(
+                f"<span style='color:{score_color};font-weight:bold'>"
+                f"Score de risque : {report.risk_score}</span>",
+                unsafe_allow_html=True,
+            )
+            for r in sorted(
+                report.risks,
+                key=lambda x: (x.severity == "WARNING", x.act_date),
+            ):
+                with st.expander(
+                    f"{'⛔' if r.severity == 'BLOCKING' else '⚠️'} "
+                    f"{r.act_date} · {', '.join(r.codes)} · {r.rule_id}"
+                ):
+                    st.write(r.message)
+
+        st.text_area(
+            "Rapport exportable",
+            value=format_report_text(report),
+            height=200,
+            key="csv_report_export",
+        )
+
+    elif csv_btn:
+        st.error("Uploadez un fichier CSV.")

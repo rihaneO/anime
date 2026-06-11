@@ -1,188 +1,400 @@
+"""
+NLPParser — extraction d'actes NGAP, dates et ages en texte libre.
+
+Architecture multi-pass :
+  0. Isolation des "spans parasites" (dates, annees, ages explicites)
+     -> masquage pour eviter les faux positifs lors de la detection de codes.
+  A. Codes AMO explicites : regex AMO\s*[\d.,]+ -> normalise via Referential.
+  B. Detection par libelle : score IDF-like sur les tokens du texte vs
+     l'index inverse du Referential.
+  Deduplication + tri par confiance decroissante.
+
+Design decisions :
+- Zero code AMO hardcode dans ce module : tout vient du Referential.
+- Les fonctions module-level (extract_act_codes / extract_date /
+  extract_patient_age_months) sont conservees pour la compat ascendante
+  avec les tests existants ; elles deleguent vers la nouvelle API.
+- Confiance [0.0 - 1.0] retournee par match : diagnostique d'extraction
+  consultable dans les logs et les tests.
+- Les spans AMO et les spans dates/ages ne se chevauchent jamais par
+  construction (masquage en phase 0).
+"""
+
+from __future__ import annotations
+
 import re
-from datetime import datetime
+import unicodedata
+from dataclasses import dataclass, field
+from datetime import datetime, date
+from typing import Literal, Optional
 from dateutil.relativedelta import relativedelta
 
-def extract_act_codes(text):
+from referential import Referential, normalize_text, tokenize
+
+
+# ------------------------------------------------------------------ #
+# Types
+# ------------------------------------------------------------------ #
+
+Source = Literal["explicit_amo", "alias_resolved", "libelle"]
+LIBELLE_CONFIDENCE_THRESHOLD = 0.55  # seuil IDF normalise
+
+
+@dataclass(frozen=True)
+class ExtractionMatch:
     """
-    Extracts act codes like AMO_34, AMO 34, 13.5, AMO 13.5.
-    Returns a list of standardized codes (e.g., 'AMO_34').
+    Un match de code detecte dans le texte.
+    - source : canal de detection
+    - confidence : 1.0 pour AMO explicite, IDF-normalise pour libelle
+    - span : (start, end) dans le texte original
     """
-    # Pattern to match AMO followed by space or underscore and then number/dots
-    # Or just numbers if explicitly labeled (though the prompt says "Code: Pattern AMO\s*[\d\.]+ or just numbers if explicitly labeled")
-    # Let's try to match "AMO" optionally followed by space/underscore, then digits/dots.
-    # Also handle standalone numbers that look like codes if they are common, but based on examples:
-    # "AMO 34", "13.5" (in "Séance rééducation 13.5"), "AMO 30".
+    code: str
+    source: Source
+    confidence: float
+    span: tuple[int, int]
 
-    # We will look for "AMO" followed by number, OR numbers that are likely act codes.
-    # Given the examples: "AMO 34", "13.5".
 
-    # Regex for "AMO" prefix. Capture digits, optionally followed by .digits
-    amo_pattern = r"(?:AMO|amo)[\s_]*(\d+(?:\.\d+)?)"
-    amo_matches = re.findall(amo_pattern, text, re.IGNORECASE)
+@dataclass
+class ParseResult:
+    codes: list[str]
+    act_date: Optional[date]
+    age_months: Optional[int]
+    matches: list[ExtractionMatch] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
-    # Regex for standalone numbers might be tricky without context, but let's look at the example "Séance rééducation 13.5".
-    # If we just match all numbers, we might get ages.
-    # "Patient Thomas, 4 ans" -> 4 is age.
-    # "13.5" is code.
-    # Let's assume codes are either prefixed with AMO OR are float-like (contain dot) OR are specifically known integers if we had a full list.
-    # For now, let's stick to explicit AMO prefix OR numbers that look like codes in specific context?
-    # The prompt says: "Pattern AMO\s*[\d\.]+ or just numbers if explicitly labeled."
-    # Let's capture "AMO X" and normalize to "AMO_X".
 
-    codes = []
-    for match in amo_matches:
-        codes.append(f"AMO_{match}")
+# ------------------------------------------------------------------ #
+# Patterns precompiles (module-level = un seul compile par processus)
+# ------------------------------------------------------------------ #
 
-    # Example 2: "Séance rééducation 13.5".
-    # If "AMO" is missing, it might be hard to distinguish from age/date parts if not careful.
-    # But usually age is integer. 13.5 is float.
-    # Let's look for numbers that appear to be acts.
-    # Maybe we can look for specific numbers if we know them from rules.json?
-    # But the parser should be generic.
+# AMO suivi du coefficient ; gere separateur espace/tiret bas/rien,
+# et virgule decimale francaise ("AMO 34,02" -> "AMO_34.02")
+_RE_AMO = re.compile(
+    r"\b(?:AMO)[\s_]*(\d+(?:[.,]\d+)?)\b",
+    re.IGNORECASE,
+)
 
-    # Let's try to find numbers that are NOT part of a date or age string.
-    # This is getting complex.
-    # Let's refine the approach:
-    # 1. Look for AMO-prefixed codes.
-    # 2. Look for "standalone" numbers that might be codes.
-    #    In "Séance rééducation 13.5", "13.5" is the code.
-    #    In "Bilan 34", "34" is the code.
+# Date d'acte : DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY (avec annee sur 2 ou 4 chiffres)
+_RE_DATE = re.compile(r"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})\b")
 
-    # Let's search for patterns that look like codes.
-    # \b\d+(\.\d+)?\b
-    # But exclude if followed by "ans", "mois", "an".
-    # And exclude if it looks like a year (4 digits, start with 19 or 20) or day (1-31).
+# Date de naissance : "né le", "née le", "DOB :", etc.
+_RE_DOB = re.compile(
+    r"\bn[ée]{1,2}e?(?:\s+le)?\s*:?\s*(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})\b"
+    r"|"
+    r"\bdob\s*:?\s*(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})\b",
+    re.IGNORECASE,
+)
 
-    # Let's try a simpler approach first: specific regex for the examples provided.
-    # "13.5" -> `\b\d+\.\d+\b` (likely a code like 13.5, 12.1)
-    # "34" -> `\b\d+\b` (could be anything).
+# Age en annees avec optionnel "et X mois"
+_RE_AGE_ANS = re.compile(r"\b(\d{1,2})\s*ans?\b", re.IGNORECASE)
+_RE_AGE_MOIS_SUFFIX = re.compile(r"\bet\s+(\d{1,2})\s*mois\b", re.IGNORECASE)
+_RE_AGE_MOIS_SEUL = re.compile(r"\b(\d{1,3})\s*mois\b", re.IGNORECASE)
 
-    # Let's trust the "AMO" prefix for now, and maybe a lookbehind for words like "Bilan", "Séance"?
-    # "Bilan 34" -> Code 34.
-    # "Séance ... 13.5" -> Code 13.5.
+# Annees a 4 chiffres (19xx / 20xx) -> parasite a masquer
+_RE_YEAR_4 = re.compile(r"\b(?:19|20)\d{2}\b")
 
-    # Improved regex strategy:
-    # 1. `AMO[\s_]*([\d\.]+)`
-    # 2. `(?:Bilan|Séance|Cotation)[\s\w]*\s+([\d\.]+)` ??
 
-    # Let's look at Example 2: "Séance rééducation 13.5 + Bilan 34."
-    # We can match `\b(\d+(?:\.\d+)?)\b` and filter.
+def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """Remplace les caracteres des spans par des espaces (preserves les positions)."""
+    buf = bytearray(text.encode("utf-8"))  # on travaille byte par byte sur l'ASCII
+    # On rebascule sur une liste de chars pour la simplicite (texte pas enorme)
+    chars = list(text)
+    for s, e in spans:
+        for i in range(s, min(e, len(chars))):
+            chars[i] = "\x00"  # marqueur NULL ; ne matche pas les regexes metier
+    return "".join(chars)
 
-    potential_numbers = re.finditer(r"\b(\d+(?:\.\d+)?)\b", text)
 
-    for match in potential_numbers:
-        num_str = match.group(1)
-        start, end = match.span()
+def _year2(y: str) -> int:
+    return int("20" + y) if len(y) == 2 else int(y)
 
-        # Check context
-        context_after = text[end:end+10].lower()
-        context_before = text[max(0, start-10):start].lower()
 
-        # Ignore if follows "AMO" (already caught)
-        if re.search(r"amo[\s_]*$", context_before):
-            continue
+# ------------------------------------------------------------------ #
+# NLPParser
+# ------------------------------------------------------------------ #
 
-        # Ignore if followed by "ans", "mois", "an" (Age)
-        if re.match(r"\s*(ans?|mois?)", context_after):
-            continue
-
-        # Ignore if part of a date (XX/XX/XX)
-        # Check if surrounded by slashes
-        if (start > 0 and text[start-1] == '/') or (end < len(text) and text[end] == '/'):
-            continue
-
-        # Ignore years (19XX, 20XX) if they seem to be dates?
-        # A code could be 2026? Unlikely for acts.
-        if len(num_str) == 4 and (num_str.startswith("19") or num_str.startswith("20")):
-             # Check if it looks like a year in a date context
-             continue
-
-        # Ignore small integers that might be day/month unless clearly a code?
-        # "Patient Thomas, 4 ans." -> 4 handled by age check.
-        # "Fait le 12..." -> 12 handled by date check.
-
-        # If it's a float like 13.5, it's likely a code.
-        if '.' in num_str:
-            code = f"AMO_{num_str}"
-            if code not in codes:
-                codes.append(code)
-        elif num_str in ["34", "30", "20", "10", "15"]:
-            # Heuristic: Common AMO codes without prefix
-            # If "Bilan" or "Séance" appears nearby?
-            # "Bilan 34"
-            if "bilan" in context_before or "séance" in context_before or "seance" in context_before or "cotation" in context_before:
-                 code = f"AMO_{num_str}"
-                 if code not in codes:
-                     codes.append(code)
-
-            # Additional heuristic from Example 2: "Séance rééducation 13.5 + Bilan 34"
-            # If we missed it, let's just be permissive for now?
-            # No, false positives are bad.
-
-    return list(set(codes))
-
-def extract_date(text):
+class NLPParser:
     """
-    Extracts date: DD/MM/YYYY or DD/MM/YY.
-    Returns datetime object or None.
+    Parser pilote par un Referential.
+    Aucun code AMO n'est hardcode dans cette classe.
     """
-    # Regex for date
-    date_pattern = r"\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b"
-    match = re.search(date_pattern, text)
 
-    if match:
-        day, month, year = match.groups()
-        if len(year) == 2:
-            year = "20" + year # Assume 20xx
+    def __init__(self, ref: Referential) -> None:
+        self._ref = ref
 
-        try:
-            return datetime(int(year), int(month), int(day)).date()
-        except ValueError:
+    # ------------------------------------------------------------------ #
+    # API principale
+    # ------------------------------------------------------------------ #
+
+    def parse(self, text: str) -> ParseResult:
+        warnings: list[str] = []
+
+        # --- Phase 0 : date d'acte et age (inchanges par masquage) ---
+        act_date = self._extract_act_date(text)
+        ref_date = act_date or datetime.now().date()
+        age = self._extract_age(text, ref_date)
+
+        if act_date is None:
+            warnings.append("Date non detectee : date du jour utilisee par defaut.")
+        if age is None:
+            warnings.append("Age patient non detecte.")
+
+        # --- Phase 1 : construire le masque des spans parasites ---
+        parasite = list(self._parasite_spans(text))
+        masked = _mask_spans(text, parasite)
+
+        # --- Phase 2 : extraction des codes ---
+        matches: list[ExtractionMatch] = []
+        matches.extend(self._pass_explicit_amo(masked))
+
+        found_codes = {m.code for m in matches}
+        libelle_matches = [
+            m for m in self._pass_libelle(text)
+            if m.code not in found_codes
+        ]
+        matches.extend(libelle_matches)
+
+        # --- Phase 3 : deduplication par code, tri confiance desc ---
+        deduped = _deduplicate(matches)
+
+        # Avertit sur les codes inconnus du referentiel
+        for m in deduped:
+            if self._ref.get_acte(m.code) is None:
+                warnings.append(
+                    f"Code '{m.code}' extrait mais absent du referentiel "
+                    f"(score {m.confidence:.2f}, source={m.source})."
+                )
+
+        return ParseResult(
+            codes=[m.code for m in deduped],
+            act_date=act_date,
+            age_months=age,
+            matches=deduped,
+            warnings=warnings,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Phase 0 : extraction date et age
+    # ------------------------------------------------------------------ #
+
+    def _extract_act_date(self, text: str) -> Optional[date]:
+        """
+        Retourne la premiere date du texte qui n'est pas une date de naissance.
+        En cas d'ambiguite, la date precedee de "fait le", "le", etc. prime.
+        """
+        dob_spans = {m.span() for m in _RE_DOB.finditer(text)}
+
+        # Essaie les dates avec contexte "fait le / du" en priorite
+        priority = re.compile(
+            r"(?:fait\s+le|du|le|en\s+date\s+du)\s+"
+            r"(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})\b",
+            re.IGNORECASE,
+        )
+        for m in priority.finditer(text):
+            if any(ds[0] <= m.start() <= ds[1] for ds in dob_spans):
+                continue
+            try:
+                d, mo, y = int(m.group(1)), int(m.group(2)), _year2(m.group(3))
+                return date(y, mo, d)
+            except ValueError:
+                continue
+
+        # Fallback : premiere date hors DOB
+        for m in _RE_DATE.finditer(text):
+            if any(ds[0] <= m.start() <= ds[1] for ds in dob_spans):
+                continue
+            try:
+                d, mo, y = int(m.group(1)), int(m.group(2)), _year2(m.group(3))
+                return date(y, mo, d)
+            except ValueError:
+                continue
+        return None
+
+    def _extract_age(self, text: str, ref_date: date) -> Optional[int]:
+        """
+        Extraction dans l'ordre de precision decroissante :
+        1. "X ans [et Y mois]"
+        2. "X mois" seul
+        3. "Né le DD/MM/YYYY"
+        """
+        # 1. Age en annees
+        m_ans = _RE_AGE_ANS.search(text)
+        if m_ans:
+            years = int(m_ans.group(1))
+            m_mo = _RE_AGE_MOIS_SUFFIX.search(text[m_ans.end(): m_ans.end() + 30])
+            months = int(m_mo.group(1)) if m_mo else 0
+            return years * 12 + months
+
+        # 2. Age en mois seul
+        m_mo = _RE_AGE_MOIS_SEUL.search(text)
+        if m_mo:
+            return int(m_mo.group(1))
+
+        # 3. Date de naissance
+        m_dob = _RE_DOB.search(text)
+        if m_dob:
+            # Le pattern a 2 alternatives (nee / dob) -> choisit les groupes non-None
+            groups = [g for g in m_dob.groups() if g is not None]
+            if len(groups) == 3:
+                try:
+                    dob = date(_year2(groups[2]), int(groups[1]), int(groups[0]))
+                    delta = relativedelta(ref_date, dob)
+                    return delta.years * 12 + delta.months
+                except ValueError:
+                    pass
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Phase 1 : spans parasites
+    # ------------------------------------------------------------------ #
+
+    def _parasite_spans(self, text: str):
+        """
+        Genere les spans a masquer avant la detection de codes AMO :
+        dates, annees a 4 chiffres, ages numeriques.
+        Utilise un generateur pour eviter de materialiser une grande liste.
+        """
+        seen: set[tuple[int, int]] = set()
+
+        def emit(span: tuple[int, int]):
+            if span not in seen:
+                seen.add(span)
+                return span
             return None
-    return None
 
-def extract_patient_age_months(text, ref_date=None):
+        for m in _RE_DATE.finditer(text):
+            s = emit(m.span())
+            if s:
+                yield s
+        for m in _RE_YEAR_4.finditer(text):
+            s = emit(m.span())
+            if s:
+                yield s
+        for m in _RE_AGE_ANS.finditer(text):
+            s = emit(m.span())
+            if s:
+                yield s
+        for m in _RE_AGE_MOIS_SEUL.finditer(text):
+            s = emit(m.span())
+            if s:
+                yield s
+
+    # ------------------------------------------------------------------ #
+    # Pass A : AMO explicites
+    # ------------------------------------------------------------------ #
+
+    def _pass_explicit_amo(self, masked: str) -> list[ExtractionMatch]:
+        """
+        Detecte les patterns AMO explicites dans le texte masque.
+        Normalise via Referential.resolve() pour obtenir le code canonique.
+        Confiance = 1.0 si le code est dans le referentiel, 0.75 sinon.
+        """
+        results: list[ExtractionMatch] = []
+        for m in _RE_AMO.finditer(masked):
+            raw_num = m.group(1).replace(",", ".")
+            raw_code = f"AMO_{raw_num}"
+            canonical = self._ref.resolve(raw_code)
+            if canonical:
+                source: Source = (
+                    "explicit_amo" if raw_code == canonical else "alias_resolved"
+                )
+                results.append(ExtractionMatch(
+                    code=canonical,
+                    source=source,
+                    confidence=1.0,
+                    span=m.span(),
+                ))
+            else:
+                # Code inconnu : on le garde avec confiance reduite
+                results.append(ExtractionMatch(
+                    code=raw_code,
+                    source="explicit_amo",
+                    confidence=0.75,
+                    span=m.span(),
+                ))
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Pass B : detection par libelle (IDF-like)
+    # ------------------------------------------------------------------ #
+
+    def _pass_libelle(self, text: str) -> list[ExtractionMatch]:
+        """
+        Calcule un score IDF-like pour chaque acte du referentiel en cherchant
+        ses tokens dans le texte.
+
+        score(code) = sum(IDF(t) for t in tokens_text & tokens_libelle(code))
+
+        On normalise par le score max pour obtenir une confiance [0, 1].
+        Un seuil (LIBELLE_CONFIDENCE_THRESHOLD) filtre le bruit.
+        """
+        text_tokens = tokenize(text)
+        if not text_tokens:
+            return []
+
+        idx = self._ref.token_index()
+        scores: dict[str, float] = {}
+        for token in text_tokens:
+            for code, weight in idx.get(token, []):
+                scores[code] = scores.get(code, 0.0) + weight
+
+        if not scores:
+            return []
+
+        max_score = max(scores.values())
+        results: list[ExtractionMatch] = []
+        for code, score in scores.items():
+            conf = score / max_score
+            if conf >= LIBELLE_CONFIDENCE_THRESHOLD:
+                results.append(ExtractionMatch(
+                    code=code,
+                    source="libelle",
+                    confidence=round(conf, 4),
+                    span=(0, len(text)),
+                ))
+        return results
+
+
+# ------------------------------------------------------------------ #
+# Helpers
+# ------------------------------------------------------------------ #
+
+def _deduplicate(matches: list[ExtractionMatch]) -> list[ExtractionMatch]:
     """
-    Extracts age in months.
-    Can come from "X ans", "X mois", or DOB "Né le...".
-    ref_date: datetime.date to calculate age from DOB. Defaults to today.
+    Deduplication par code canonique.
+    En cas de doublon, garde le match de confiance la plus elevee.
     """
+    best: dict[str, ExtractionMatch] = {}
+    for m in matches:
+        if m.code not in best or m.confidence > best[m.code].confidence:
+            best[m.code] = m
+    return sorted(best.values(), key=lambda x: -x.confidence)
+
+
+# ------------------------------------------------------------------ #
+# API module-level (compat ascendante avec les anciens tests et app.py)
+# ------------------------------------------------------------------ #
+
+def _default_ref() -> Referential:
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return Referential(os.path.join(base, "rules.json"))
+
+
+import os  # noqa: E402  (import retarde pour eviter la circularite potentielle)
+
+
+def extract_act_codes(text: str, ref: Optional[Referential] = None) -> list[str]:
+    """Compat. Preferer NLPParser(ref).parse(text).codes directement."""
+    return NLPParser(ref or _default_ref()).parse(text).codes
+
+
+def extract_date(text: str) -> Optional[date]:
+    return NLPParser(_default_ref())._extract_act_date(text)
+
+
+def extract_patient_age_months(
+    text: str, ref_date: Optional[date] = None
+) -> Optional[int]:
     if ref_date is None:
         ref_date = datetime.now().date()
-
-    text_lower = text.lower()
-
-    # 1. Explicit Age: "X ans", "X mois"
-    # "4 ans"
-    ans_match = re.search(r"(\d+)[\s]*(?:ans?|a\b)", text_lower)
-    if ans_match:
-        years = int(ans_match.group(1))
-        # Look for months too: "4 ans et 6 mois"
-        mois_match = re.search(r"(\d+)[\s]*mois", text_lower[ans_match.end():])
-        months = int(mois_match.group(1)) if mois_match else 0
-        return years * 12 + months
-
-    # "X mois" (only if ans wasn't found first to avoid double count if logic was different, but here ans takes precedence)
-    # If "4 ans" is not found, look for "X mois"
-    mois_only_match = re.search(r"(\d+)[\s]*mois", text_lower)
-    if mois_only_match:
-        return int(mois_only_match.group(1))
-
-    # 2. DOB: "Né le DD/MM/YYYY" or "Né(e) le..."
-    dob_pattern = r"(?:n[ée]+(?:\s+le)?|dob)\s*[:\s]*(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})"
-    dob_match = re.search(dob_pattern, text_lower)
-
-    if dob_match:
-        day, month, year = dob_match.groups()
-        if len(year) == 2:
-            year = "20" + year
-
-        try:
-            dob = datetime(int(year), int(month), int(day)).date()
-            # Calculate delta in months
-            delta = relativedelta(ref_date, dob)
-            return delta.years * 12 + delta.months
-        except ValueError:
-            pass
-
-    return None
+    return NLPParser(_default_ref())._extract_age(text, ref_date)

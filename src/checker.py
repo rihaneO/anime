@@ -1,36 +1,52 @@
 """
-Moteur de conformite NGAP pour orthophonistes.
+Moteur de conformite NGAP — v3.
 
-Conception (v2) :
-- AUCUN `eval()`. Les regles sont typees et evaluees par un dispatch Python.
-  Chaque regle a un `type` qui correspond a une methode `_rule_<type>`.
-- Les regles sont versionnees par date d'effet (`date_effet` / `date_fin`),
-  ce qui permet d'absorber les avenants successifs sans casser l'historique.
-- Le referentiel des actes porte les coefficients, ce qui permet de calculer
-  le montant theorique (coefficient x valeur de la lettre-cle AMO).
+Changements v3 :
+- Pilote par Referential (objet type) au lieu de charger rules.json directement.
+  Le Checker accepte soit un Referential deja construit, soit un rules_path
+  pour la compat ascendante.
+- Aucun eval(). Dispatch Python par type de regle (Regle.rule_type).
+- Versionnement temporel : _rule_is_active() filtre les regles selon la date
+  de l'acte vs date_effet/date_fin de la regle.
+- normalize_codes() : resolution des alias via Referential.
+- compute_amount() : coefficient × valeur lettre-cle AMO (avec decote opt.).
 """
 
-import json
-import os
-from datetime import datetime, date
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any, Optional
+
+from referential import Referential, Regle
 
 
-def _parse_iso(d):
-    """Parse une date ISO 'YYYY-MM-DD' en date, ou None."""
-    if not d:
-        return None
-    if isinstance(d, date):
-        return d
-    return datetime.strptime(d, "%Y-%m-%d").date()
+def _today() -> date:
+    return datetime.now().date()
 
 
 class Checker:
-    def __init__(self, rules_path="rules.json", db=None):
-        self.rules = self._load_rules(rules_path)
+
+    def __init__(
+        self,
+        rules_path: Optional[str] = None,
+        db=None,
+        ref: Optional[Referential] = None,
+    ) -> None:
+        if ref is not None:
+            self._ref = ref
+        elif rules_path is not None:
+            self._ref = Referential(rules_path)
+        else:
+            raise ValueError("Fournir rules_path ou ref.")
+
         self.db = db
+
+        # Compat ascendante : certains tests accdent checker.rules directement.
+        self.rules = self._ref.raw()
         self.actes = self.rules.get("actes", {})
-        # Dispatch : type de regle -> methode d'evaluation. Pas d'eval().
-        self._dispatch = {
+
+        # Dispatch rule_type -> handler
+        self._dispatch: dict[str, Any] = {
             "age_max": self._rule_age_max,
             "renouvellement": self._rule_renouvellement,
             "cumul_bilan_seance": self._rule_cumul_bilan_seance,
@@ -38,72 +54,72 @@ class Checker:
         }
 
     # ------------------------------------------------------------------ #
-    # Chargement
-    # ------------------------------------------------------------------ #
-    def _load_rules(self, path):
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Rules file not found: {path}")
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    # ------------------------------------------------------------------ #
     # API publique
     # ------------------------------------------------------------------ #
-    def check(self, parsed_data, patient_id=None):
+
+    def check(self, parsed_data: dict, patient_id: Optional[str] = None) -> list[dict]:
         """
         parsed_data: {
-            'codes': ['AMO_34.02', 'AMO_13.5'],
-            'date': datetime.date,
+            'codes': list[str],   # codes canoniques (apres normalize_codes)
+            'date': date | None,
             'age_months': int | None
         }
-        patient_id: identifiant pour la recherche d'historique en base.
-
-        Retourne une liste de dict :
-            {'id', 'message', 'severity'}.
+        Retourne : [{'id', 'message', 'severity'}, ...]
         """
-        results = []
         ctx = self._build_context(parsed_data, patient_id)
-
-        for rule in self.rules.get("regles", []):
-            if not self._rule_is_active(rule, ctx["current_date"]):
+        results = []
+        for regle in self._ref.regles():
+            if not self._rule_is_active(regle, ctx["current_date"]):
                 continue
-            handler = self._dispatch.get(rule.get("type"))
+            handler = self._dispatch.get(regle.rule_type)
             if handler is None:
-                # Type de regle inconnu : on ignore plutot que de planter.
                 continue
-            if handler(rule, ctx):
+            if handler(regle, ctx):
                 results.append({
-                    "id": rule["id"],
-                    "message": rule["message"],
-                    "severity": rule["severite"],
+                    "id": regle.id,
+                    "message": regle.message,
+                    "severity": regle.severite,
                 })
         return results
 
-    def compute_amount(self, codes, decote_pct=0):
+    def normalize_codes(self, codes: list[str]) -> list[str]:
         """
-        Calcule le montant theorique total : somme(coefficient x valeur AMO),
-        avec decote optionnelle (en %). Retourne un float arrondi au centime.
+        Resout les codes bruts (issus du parser) vers les codes canoniques
+        du referentiel via la table d'aliases.
+        Les doublons sont elimines (ordre de premiere apparition conserve).
         """
-        valeur = (
-            self.rules.get("lettre_cle", {})
-            .get("valeur_eur", {})
-            .get("metropole", 0)
-        )
-        total = 0.0
+        seen: set[str] = set()
+        out: list[str] = []
         for code in codes:
-            acte = self.actes.get(code)
-            if acte and acte.get("coefficient") is not None:
-                total += acte["coefficient"] * valeur
+            canonical = self._ref.resolve(code) or code
+            if canonical not in seen:
+                seen.add(canonical)
+                out.append(canonical)
+        return out
+
+    def compute_amount(self, codes: list[str], decote_pct: float = 0) -> float:
+        """
+        Montant theorique : sum(coefficient × valeur_AMO) avec decote opt. (%).
+        """
+        valeur = self._ref.lettre_cle().valeur_metropole
+        total = sum(
+            (self._ref.get_acte(c).coefficient if self._ref.get_acte(c) else 0)
+            for c in codes
+        )
         if decote_pct:
-            total *= (1 - decote_pct / 100.0)
-        return round(total, 2)
+            total *= 1 - decote_pct / 100.0
+        return round(total * valeur, 2)
+
+    def get_bilan_codes(self) -> list[str]:
+        return self._ref.actes_by_type("bilan")
 
     # ------------------------------------------------------------------ #
     # Contexte
     # ------------------------------------------------------------------ #
-    def _build_context(self, parsed_data, patient_id):
-        current_date = parsed_data.get("date") or datetime.now().date()
-        input_codes = parsed_data.get("codes", []) or []
+
+    def _build_context(self, parsed_data: dict, patient_id: Optional[str]) -> dict:
+        current_date = parsed_data.get("date") or _today()
+        input_codes = parsed_data.get("codes") or []
 
         bilan_codes = [c for c in input_codes if self._get_act_type(c) == "bilan"]
         seance_codes = [c for c in input_codes if self._get_act_type(c) == "reeducation"]
@@ -124,79 +140,46 @@ class Checker:
         }
 
     # ------------------------------------------------------------------ #
-    # Helpers referentiel
+    # Helpers
     # ------------------------------------------------------------------ #
-    def normalize_codes(self, codes):
-        """
-        Resout les alias vers les codes canoniques du referentiel.
 
-        Les orthophonistes ecrivent "AMO 34" — le parser produit "AMO_34" —
-        mais l'avenant 21 a redefini le coefficient a 34.02, donc le code
-        canonique est "AMO_34.02". Sans normalisation, aucune regle bilan
-        ne se declenchait. Les alias sont declares dans rules.json.
-        """
-        aliases = self.rules.get("aliases", {})
-        normalized = []
-        seen = set()
-        for code in codes:
-            # Essaie l'alias exact, puis sans prefixe "AMO_"
-            resolved = (
-                aliases.get(code)
-                or (code if code in self.actes else None)
-                or aliases.get(code.replace("AMO_", "", 1))
-            )
-            canonical = resolved or code
-            if canonical not in seen:
-                seen.add(canonical)
-                normalized.append(canonical)
-        return normalized
+    def _get_act_type(self, code: str) -> Optional[str]:
+        acte = self._ref.get_acte(code)
+        return acte.act_type if acte else None
 
-    def _get_act_type(self, code):
-        acte = self.actes.get(code)
-        return acte.get("type") if acte else None
-
-    def get_bilan_codes(self):
-        """Liste des codes de type 'bilan' connus dans le referentiel."""
-        return [c for c, a in self.actes.items() if a.get("type") == "bilan"]
-
-    def _rule_is_active(self, rule, on_date):
-        """Vrai si la regle est en vigueur a la date de l'acte."""
-        debut = _parse_iso(rule.get("date_effet"))
-        fin = _parse_iso(rule.get("date_fin"))
-        if debut and on_date < debut:
+    @staticmethod
+    def _rule_is_active(regle: Regle, on_date: date) -> bool:
+        if regle.date_effet and on_date < regle.date_effet:
             return False
-        if fin and on_date > fin:
+        if regle.date_fin and on_date > regle.date_fin:
             return False
         return True
 
     # ------------------------------------------------------------------ #
-    # Evaluateurs de regles (un par type) — aucun eval()
+    # Evaluateurs (un par rule_type) — aucun eval()
     # ------------------------------------------------------------------ #
-    def _rule_age_max(self, rule, ctx):
-        p = rule.get("params", {})
+
+    def _rule_age_max(self, regle: Regle, ctx: dict) -> bool:
+        p = regle.params
         code = p.get("code")
         age = ctx["age_patient_mois"]
         if code not in ctx["input_codes"]:
             return False
-        if age is None:  # age inconnu => on ne peut pas rejeter (fail-safe)
-            return False
+        if age is None:
+            return False  # age inconnu -> pas de rejet (fail-safe)
         return age > p.get("age_max_mois", float("inf"))
 
-    def _rule_renouvellement(self, rule, ctx):
-        p = rule.get("params", {})
+    def _rule_renouvellement(self, regle: Regle, ctx: dict) -> bool:
         if not ctx["bilan_codes"]:
             return False
         last = ctx["last_bilan_date"]
         if last is None:
             return False
-        delta = (ctx["current_date"] - last).days
-        return delta < p.get("delai_jours", 365)
+        return (ctx["current_date"] - last).days < regle.params.get("delai_jours", 365)
 
-    def _rule_cumul_bilan_seance(self, rule, ctx):
-        # Bilan + seance le meme jour (le rapport d'entree porte sur une seule date).
+    def _rule_cumul_bilan_seance(self, regle: Regle, ctx: dict) -> bool:
         return bool(ctx["bilan_codes"]) and bool(ctx["seance_codes"])
 
-    def _rule_cumul_seances_meme_jour(self, rule, ctx):
-        # Avenant 21 : 2 seances de reeducation distinctes le meme jour =>
-        # autorise sous 3 conditions non verifiables automatiquement => WARNING.
+    def _rule_cumul_seances_meme_jour(self, regle: Regle, ctx: dict) -> bool:
+        # Avenant 21 : 2 seances distinctes le meme jour = WARNING (3 conditions)
         return len(set(ctx["seance_codes"])) >= 2
