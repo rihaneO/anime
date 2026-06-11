@@ -126,6 +126,31 @@ class Checker:
     # ------------------------------------------------------------------ #
     # Helpers referentiel
     # ------------------------------------------------------------------ #
+    def normalize_codes(self, codes):
+        """
+        Resout les alias vers les codes canoniques du referentiel.
+
+        Les orthophonistes ecrivent "AMO 34" — le parser produit "AMO_34" —
+        mais l'avenant 21 a redefini le coefficient a 34.02, donc le code
+        canonique est "AMO_34.02". Sans normalisation, aucune regle bilan
+        ne se declenchait. Les alias sont declares dans rules.json.
+        """
+        aliases = self.rules.get("aliases", {})
+        normalized = []
+        seen = set()
+        for code in codes:
+            # Essaie l'alias exact, puis sans prefixe "AMO_"
+            resolved = (
+                aliases.get(code)
+                or (code if code in self.actes else None)
+                or aliases.get(code.replace("AMO_", "", 1))
+            )
+            canonical = resolved or code
+            if canonical not in seen:
+                seen.add(canonical)
+                normalized.append(canonical)
+        return normalized
+
     def _get_act_type(self, code):
         acte = self.actes.get(code)
         return acte.get("type") if acte else None
