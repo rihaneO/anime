@@ -1,0 +1,129 @@
+{
+  "schema_version": "2.0.0",
+  "source": "NGAP orthophonistes - Convention nationale du 31/10/1996, avenant n°21 (signe le 23/07/2025, en vigueur le 23/02/2026).",
+  "references": [
+    "https://www.ameli.fr/orthophoniste/exercice-liberal/facturation-remuneration/ngap",
+    "https://www.legifrance.gouv.fr/jorf/id/JORFTEXT000052178355",
+    "https://fno.fr/la-nomenclature-generale-des-actes-professionnels-ngap/"
+  ],
+  "avertissement": "Referentiel partiel a visee de demonstration. Les coefficients et regles doivent etre valides par un orthophoniste ou un conseil en gestion de cabinet avant tout usage reel. Mis a jour pour l'avenant 21.",
+  "lettre_cle": {
+    "code": "AMO",
+    "valeur_eur": {
+      "metropole": 2.60
+    },
+    "date_effet": "2026-02-23"
+  },
+  "aliases": {
+    "AMO_34": "AMO_34.02",
+    "34":     "AMO_34.02",
+    "34.02":  "AMO_34.02",
+    "20":     "AMO_20",
+    "24":     "AMO_24",
+    "30":     "AMO_30",
+    "15.4":   "AMO_15.4",
+    "9.7":    "AMO_9.7",
+    "9.8":    "AMO_9.7",
+    "9.9":    "AMO_9.7",
+    "13.5":   "AMO_13.5"
+  },
+  "actes": {
+    "AMO_20": {
+      "code": "AMO_20",
+      "libelle": "Bilan prevention parental (enfant de moins de 3 ans)",
+      "type": "bilan",
+      "coefficient": 20,
+      "contraintes": {
+        "age_max_mois": 36
+      }
+    },
+    "AMO_24": {
+      "code": "AMO_24",
+      "libelle": "Bilan d'aptitudes a l'acquisition du langage ecrit",
+      "type": "bilan",
+      "coefficient": 24
+    },
+    "AMO_30": {
+      "code": "AMO_30",
+      "libelle": "Bilan de la communication et du langage",
+      "type": "bilan",
+      "coefficient": 30
+    },
+    "AMO_34.02": {
+      "code": "AMO_34.02",
+      "libelle": "Bilan du langage ecrit",
+      "type": "bilan",
+      "coefficient": 34.02
+    },
+    "AMO_15.4": {
+      "code": "AMO_15.4",
+      "libelle": "Reeducation (seance ~45 min, min 30 min)",
+      "type": "reeducation",
+      "coefficient": 15.4,
+      "duree_minutes_cible": 45,
+      "duree_minutes_min": 30
+    },
+    "AMO_9.7": {
+      "code": "AMO_9.7",
+      "libelle": "Reeducation (seance ~30 min, min 20 min)",
+      "type": "reeducation",
+      "coefficient": 9.7,
+      "duree_minutes_cible": 30,
+      "duree_minutes_min": 20
+    },
+    "AMO_13.5": {
+      "code": "AMO_13.5",
+      "libelle": "Reeducation des troubles d'articulation isoles",
+      "type": "reeducation",
+      "coefficient": 13.5
+    }
+  },
+  "regles": [
+    {
+      "id": "R1",
+      "nom": "Limite d'age - AMO 20 (bilan prevention parental)",
+      "type": "age_max",
+      "date_effet": "1996-10-31",
+      "date_fin": null,
+      "severite": "BLOCKING",
+      "message": "REJET: AMO 20 (bilan prevention parental) interdit si le patient a plus de 3 ans (36 mois).",
+      "params": {
+        "code": "AMO_20",
+        "age_max_mois": 36
+      }
+    },
+    {
+      "id": "RT1",
+      "nom": "Renouvellement de bilan a moins de 12 mois (decote 30%)",
+      "type": "renouvellement",
+      "date_effet": "1996-10-31",
+      "date_fin": null,
+      "severite": "WARNING",
+      "message": "ALERTE: Un bilan a deja ete facture pour ce patient il y a moins d'un an. Le bilan de renouvellement doit etre facture avec une decote de 30%.",
+      "params": {
+        "delai_jours": 365,
+        "decote_pct": 30
+      }
+    },
+    {
+      "id": "R16",
+      "nom": "Cumul interdit Bilan + Seance le meme jour",
+      "type": "cumul_bilan_seance",
+      "date_effet": "1996-10-31",
+      "date_fin": null,
+      "severite": "BLOCKING",
+      "message": "REJET: Un bilan et une seance de reeducation ne peuvent pas etre factures le meme jour.",
+      "params": {}
+    },
+    {
+      "id": "A21_CUMUL",
+      "nom": "Cumul de 2 seances le meme jour (avenant 21)",
+      "type": "cumul_seances_meme_jour",
+      "date_effet": "2026-02-23",
+      "date_fin": null,
+      "severite": "WARNING",
+      "message": "ATTENTION (avenant 21): 2 seances le meme jour ne sont cumulables QUE s'il s'agit d'actes de reeducation differents, relevant de 2 projets reeducatifs distincts ET issus de 2 prescriptions ou 2 bilans distincts. Verifiez ces 3 conditions avant facturation.",
+      "params": {}
+    }
+  ]
+}
